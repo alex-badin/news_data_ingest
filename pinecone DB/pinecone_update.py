@@ -14,19 +14,18 @@ from tenacity import (
 )  # for exponential backoff
 
 import openai
-from openai.embeddings_utils import get_embedding
 import pinecone
 from telethon import TelegramClient
 from sumy.parsers.plaintext import PlaintextParser
 from sumy.nlp.tokenizers import Tokenizer
 from sumy.summarizers.lsa import LsaSummarizer
 
-keys_path = '../keys/'
-data_path = '../../TG_messages/'
+import nltk
+nltk.download('punkt')
+
+keys_path = 'keys/'
 
 start_date = datetime.datetime(2023, 10, 1) # minimum date for TelegramClient
-
-# %%
 # set to True if you want to save the pickle file (unreliable, probably due to different pandas versions, better to save to csv)
 save_pickle = False
 
@@ -34,7 +33,7 @@ with open(keys_path+'api_keys.json') as f:
   data = json.loads(f.read())
 
 # load TG credentials
-api_id = data['api_id'] 
+api_id = data['api_id']
 api_hash = data['api_hash']
 phone = data['phone']
 
@@ -45,17 +44,7 @@ openai_key = data['openai_key']
 pine_key = data['pine_key']
 pine_env = data['pine_env']
 
-# %% [markdown]
-# Questions
-# 1) Identify which data to download:
-# - by date
-# - by id
-# Anyway need to store last date or id. So let's keep it last_id.
-# 
-# 2) Remove duplicates in pinecone 
-# - they should not be there as id is exactly channel + message_id
 
-# %% [markdown]
 # Steps (per each channel):
 # - identify last_id (channels.csv)
 # - download from TG as per last_id
@@ -82,7 +71,7 @@ def clean_text(text):
                                "\U0001F680-\U0001F6FF"  # Transport & Map Symbols
                                "\U0001F1E0-\U0001F1FF"  # Flags (iOS)
                                "]+", flags=re.UNICODE)
-    
+
     # Remove emojis
     text = emoji_pattern.sub(r'', str(text))
     # Regular expression for URLs
@@ -94,7 +83,7 @@ def clean_text(text):
     # Remove any remaining variation selectors
     text = ''.join(char for char in text if unicodedata.category(char) != 'Mn')
 
-    #Remove Foreign Agent text    
+    #Remove Foreign Agent text
     pattern = re.compile(r'[А-ЯЁ18+]{3,}\s[А-ЯЁ()]{5,}[^\n]*ИНОСТРАННОГО АГЕНТА')
     text = pattern.sub('', text)
     name1 = 'ПИВОВАРОВА АЛЕКСЕЯ ВЛАДИМИРОВИЧА'
@@ -118,8 +107,8 @@ def process_new_messages(df, channel, stance):
     # add channel name & stance
     df.loc[:, 'channel'] = channel
     df.loc[:, 'stance'] = stance
-    df.drop_duplicates(subset=['id'], inplace = True) # remove duplicates
     df.loc[:, 'cleaned_message'] = df['message'].apply(clean_text) #remove emojis, urls, foreign agent text
+    df.drop_duplicates(subset=['id'], inplace = True) # remove duplicates
     df = df[~df.cleaned_message.str.len().between(0, 30)] #remove empty or too short messages
     # summarize cleaned_messages: 2 sentences if length > 750, 3 sentences if length > 1500
     df.loc[:, 'summary'] = df['cleaned_message'].apply(lambda x: summarize(x, sentences_count=3) if len(x) > 750 else summarize(x, sentences_count=2) if len(x) > 500 else x)
@@ -129,7 +118,9 @@ def process_new_messages(df, channel, stance):
 #function to get new messages from channel
 
 async def get_new_messages(channel, last_id, stance, start_date):
-    async with TelegramClient('session', api_id, api_hash) as client:
+    async with TelegramClient('session', api_id, api_hash
+    , system_version="4.16.30-vxCUSTOM"
+    ) as client:
         # COLLECT NEW MESSAGES
         data = [] # for collecting new messages
         # check if last_id is integer (=set)
@@ -205,26 +196,33 @@ session_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") # to name s
 
 # ITERATE OVER CHANNELS (df_channels) TO UPDATE PINCONE INDEX
 df_channels = pd.read_csv('channels.csv', sep = ';')
+missed_channels = []
 for i, channel, last_id, stance in tqdm(df_channels[['channel_name', 'last_id', 'stance']].itertuples(), total=df_channels.shape[0]):
-    # get & clean new messages
     print(f"Starting channel: {channel}, last_id: {last_id}")
-    df = asyncio.run(get_new_messages(channel, last_id, stance, start_date=start_date))
-    if df is None:
+    try:
+        # get & clean new messages
+        df = asyncio.run(get_new_messages(channel, last_id, stance, start_date=start_date))
+        if df is None:
+            continue
+        # clean, summarize, add channel name & stance
+        df = process_new_messages(df, channel, stance)
+        # get embeddings with progress bar
+        df = get_embeddings_df(df, text_col='summary', model="text-embedding-ada-002")
+        # upsert to pinecone
+        upsert_to_pinecone(df, pine_index)
+
+        # save session stats for channel
+        df_channel_stats[channel] = df['date'].dt.date.value_counts()
+        df_channel_stats.to_csv(f'session_stats/channel_stats_{session_time}.csv', sep=';', index=True)
+
+        # update last_id in df_channels
+        if len(df) > 0: df_channels.loc[i, 'last_id'] = df['id'].max()
+        df_channels.to_csv('channels.csv', index=False, sep=';')
+        # save new messages to pickle (strange errors with pickle df, probably due to different pd versions)
+        if save_pickle == True:
+            save_to_pickle(df, channel)
+    except:
+        missed_channels.appned(channel)
+        print(f"!!! some ERROR happend with channel {channel}")
         continue
-    # clean, summarize, add channel name & stance
-    df = process_new_messages(df, channel, stance)
-    # get embeddings with progress bar
-    df = get_embeddings_df(df, text_col='summary', model="text-embedding-ada-002")
-    # upsert to pinecone
-    upsert_to_pinecone(df, pine_index)
-
-    # save session stats for channel
-    df_channel_stats[channel] = df['date'].dt.date.value_counts()
-    df_channel_stats.to_csv(f'../session_stats/channel_stats_{session_time}.csv', sep=';', index=True)
-
-    # update last_id in df_channels
-    if len(df) > 0: df_channels.loc[i, 'last_id'] = df['id'].max()
-    df_channels.to_csv('channels.csv', index=False, sep=';')
-    # save new messages to pickle (strange errors with pickle df, probably due to different pd versions)
-    if save_pickle == True:
-        save_to_pickle(df, channel)
+print(f"Missed channels: {', '.join(missed_channels)}")
